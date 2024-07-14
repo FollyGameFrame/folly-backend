@@ -1,0 +1,296 @@
+######## 项目依赖的环境，启动项目之前要先启动此环境 #######
+######## The environment that the project depends on, starting this environment before starting the project #######
+
+services:
+  #jaeger链路追踪 — Jaeger for tracing
+  jaeger:
+    image: jaegertracing/all-in-one:1.57.0
+    container_name: jaeger
+    restart: always
+    ports:
+      - "${JAEGER_PORT_UDP_1}:5775/udp"
+      - "${JAEGER_PORT_UDP_2}:6831/udp"
+      - "${JAEGER_PORT_UDP_3}:6832/udp"
+      - "${JAEGER_PORT_1}:5778"
+      - "${JAEGER_PORT_2}:16686"
+      - "${JAEGER_PORT_3}:14268"
+      - "${JAEGER_PORT_4}:9411"
+    environment:
+      - SPAN_STORAGE_TYPE=elasticsearch
+      - ES_SERVER_URLS=http://elasticsearch:9200
+      - LOG_LEVEL=debug
+    networks:
+      - voyager_net
+
+
+  #prometheus监控 — Prometheus for monitoring
+  prometheus:
+    image: prom/prometheus:v2.50.0
+    container_name: prometheus
+    environment:
+      # 时区上海 - Time zone Shanghai (Change if needed)
+      TZ: ${TZ}
+    volumes:
+      - ./deploy/prometheus/server/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./data/prometheus/data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: always
+    user: root
+    ports:
+      - "${PROMETHEUS_PORT}:9090"
+    networks:
+      - voyager_net
+
+  #查看prometheus监控数据 - Grafana to view Prometheus monitoring data
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: grafana
+    hostname: grafana
+    user: root
+    environment:
+      # 时区上海 - Time zone Shanghai (Change if needed)
+      TZ: ${TZ}
+    restart: always
+    volumes:
+      - ./data/grafana/data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT}:3000"
+    networks:
+      - voyager_net
+
+  #搜集kafka业务日志、存储prometheus监控数据 - Kafka for collecting business logs and storing Prometheus monitoring data
+  elasticsearch:
+    image: elasticsearch:8.13.4
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false  #禁用了 HTTPS 和身份验证(测试时候用)
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      - TZ=${TZ}
+#      - xpack.security.enabled=true
+#      - xpack.security.http.ssl.enabled=true
+#      - xpack.security.http.ssl.keystore.path=/usr/share/elasticsearch/config/certs/elastic-certificates.p12
+#      - xpack.security.http.ssl.truststore.path=/usr/share/elasticsearch/config/certs/elastic-certificates.p12
+    volumes:
+      - ./data/elasticsearch/data:/usr/share/elasticsearch/data
+    restart: always
+    ports:
+      - "${ELASTICSEARCH_PORT}:9200"
+      - "${ELASTICSEARCH_PORT_1}:9300"
+    networks:
+      - voyager_net
+
+  #查看elasticsearch数据 - Kibana to view Elasticsearch data
+  kibana:
+    image: kibana:8.13.4
+    container_name: kibana
+    environment:
+      - elasticsearch.hosts=http://elasticsearch:9200
+      - TZ=${TZ}
+    restart: always
+    networks:
+      - voyager_net
+    ports:
+      - "${KIBANA_PORT}:5601"
+    depends_on:
+      - elasticsearch
+
+  #消费kafka中filebeat收集的数据输出到es - The data output collected by FileBeat in Kafka is output to ES
+  go-stash:
+    image: kevinwan/go-stash:1.0.8 # if you "macOs intel" or "linux amd"
+#   image: kevinwan/go-stash:1.0.8-arm64 #  if you "macOs m1" or "linux arm"
+    container_name: go-stash
+    environment:
+      # 时区上海 - Time zone Shanghai (Change if needed)
+      TZ: ${TZ}
+    #user: root
+    restart: always
+    volumes:
+      - ./deploy/go-stash/etc:/app/etc
+    networks:
+      - voyager_net
+    depends_on:
+      - elasticsearch
+      - kafka
+
+  #收集业务数据 - Collect business data
+  filebeat:
+    image: elastic/filebeat:7.17.21
+    container_name: filebeat
+    environment:
+      # 时区上海 - Time zone Shanghai (Change if needed)
+      TZ: ${TZ}
+    user: root
+    restart: always
+    entrypoint: "filebeat -e -strict.perms=false"  #解决配置文件权限问题 - Solving the configuration file permissions
+    volumes:
+      - ./deploy/filebeat/conf/filebeat.yml:/usr/share/filebeat/filebeat.yml
+      # 此处需指定docker的containers目录，取决于你docker的配置 - The containers directory of docker needs to be specified here, depending on your docker configuration
+      # 如snap安装的docker，则为/var/snap/docker/common/var-lib-docker/containers - Example if docker is installed by Snap /var/snap/docker/common/var-lib-docker/containers
+      # - /var/snap/docker/common/var-lib-docker/containers:/var/lib/docker/containers
+      - /var/lib/docker/containers:/var/lib/docker/containers
+    networks:
+      - voyager_net
+    depends_on:
+      - kafka
+
+  #zookeeper是kafka的依赖 - Zookeeper is the dependencies of Kafka
+  zookeeper:
+    image: zookeeper:3.9.2
+    container_name: zookeeper
+    environment:
+      # 时区上海 - Time zone Shanghai (Change if needed)
+      TZ: ${TZ}
+    restart: always
+    ports:
+      - "${ZOOKEEPER_PORT}:2181"
+    networks:
+      - voyager_net
+
+  #消息队列 - Message queue
+  kafka:
+    image: bitnami/kafka:3.6.2
+    container_name: kafka
+    ports:
+      - "${KAFKA_PORT}:9092"
+    environment:
+      - KAFKA_ADVERTISED_HOST_NAME=kafka
+      - KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=false
+      - TZ=${TZ}
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - voyager_net
+    depends_on:
+      - zookeeper
+
+  #asynqmon asynq延迟队列、定时队列的webui - Asynqmon asynq delay queue, timing queue's webUI
+  asynqmon:
+    image: hibiken/asynqmon:latest
+    container_name: asynqmon
+    ports:
+      - "${ASYNQMON_PORT}:8080"
+    command:
+      - '--redis-addr=redis:6379'
+      - '--redis-password=G62m50oigInC30sf'
+    restart: always
+    networks:
+      - voyager_net
+    depends_on:
+      - redis
+
+  mysql:
+    image: mysql/mysql-server:8.0.32
+    container_name: mysql
+    environment:
+      # 时区上海 - Time zone Shanghai (Change if needed)
+      TZ: ${TZ}
+      # root 密码 - root password
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    ports:
+      - "${MYSQL_PORT}:3306"
+    volumes:
+      # 数据挂载 - Data mounting
+      - ./data/mysql/data:/var/lib/mysql
+      # 日志
+    command:
+      # 将mysql8.0默认密码策略 修改为 原先 策略 (mysql8.0对其默认策略做了更改 会导致密码无法匹配)
+      # Modify the Mysql 8.0 default password strategy to the original strategy (MySQL8.0 to change its default strategy will cause the password to be unable to match)
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_general_ci
+      --explicit_defaults_for_timestamp=true
+      --lower_case_table_names=1
+    privileged: true
+    restart: always
+    networks:
+      - voyager_net
+
+  #redis容器 - Redis container
+  redis:
+    image: redis:7.2.4
+    container_name: redis
+    ports:
+      - "${REDIS_PORT}:6379"
+    environment:
+      # 时区上海 - Time zone Shanghai (Change if needed)
+      TZ: ${TZ}
+    volumes:
+      # 数据文件 - data files
+      - ./data/redis/data:/data:rw
+    command: "redis-server --requirepass G62m50oigInC30sf  --appendonly yes"
+    privileged: true
+    restart: always
+    networks:
+      - voyager_net
+
+  #用于管理和监控 Kafka 集群
+#  akhq:
+#    image: tchiotludo/akhq
+#    container_name: akhq
+#    ports:
+#      - 9050:8080
+#    environment:
+#      AKHQ_CONFIGURATION: |
+#        akhq:
+#          server:
+#            access-log:
+#              enabled: true
+#            http:
+#              port: 8080
+#          security:
+#            default-group: no-roles
+#            groups:
+#              - name: admin
+#                roles:
+#                  - topic/read
+#                  - topic/insert
+#                  - topic/delete
+#                  - topic/config/update
+#                  - node/read
+#                  - topic/data/read
+#                  - topic/data/insert
+#                  - topic/data/delete
+#                  - group/read
+#                  - group/delete
+#                  - group/offsets/update
+#                  - registry/read
+#                  - registry/insert
+#                  - registry/update
+#                  - registry/delete
+#                  - connect/read
+#                  - connect/insert
+#                  - connect/update
+#                  - connect/delete
+#                  - connect/state/update
+#            users:
+#              - username: admin
+#                password: admin
+#                groups:
+#                  - admin
+#          connections:
+#            kafka:
+#              properties:
+#                bootstrap.servers: "kafka:9092"
+#          micronaut:
+#              security:
+#                token:
+#                  jwt:
+#                    signatures:
+#                      secret:
+#                        generator:
+#                          secret: 'ae0536f9-6450-4606-8e93-5a19ed505da0'
+#    networks:
+#      - voyager_net
+
+networks:
+  voyager_net:
+    external: true
+    driver: ${NETWORKS_DRIVER}
+    ipam:
+      config:
+        - subnet: 172.16.0.0/16
